@@ -19,11 +19,10 @@ st.title("📊 MaxCode | Smart Excel Grabber")
 st.markdown("Upload Excel files, extract specified columns, flag deleted rows & column mismatches.")
 
 # --- Logging Setup ---
-# Basic logging configuration - will log to console where Streamlit runs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ========================
-# Helper Functions (Copied from Colab version)
+# Helper Functions
 # ========================
 
 def col_letter_to_index(letter):
@@ -52,75 +51,56 @@ def find_header_and_columns(df_raw, required_labels, optional_labels, max_scan_r
         return None, {}, None
 
     num_rows_to_scan = min(max_scan_rows, len(df_raw))
-    all_labels_to_find = [lbl for lbl in (required_labels + optional_labels) if lbl] # Filter out empty strings
-    if not all_labels_to_find: # Nothing to search for
-         # Assume first row is header if no labels are provided to search for
-         header_row_index = 0
-         header_values = df_raw.iloc[header_row_index].tolist() if len(df_raw) > 0 else []
+    all_labels_to_find = [lbl for lbl in (required_labels + optional_labels) if lbl]
 
-         # Clean column names (convert to string, strip, handle duplicates)
+    if not all_labels_to_find: # Assume first row is header if no labels provided
+         header_row_index = 0 if len(df_raw) > 0 else None
+         if header_row_index is None: return None, {}, []
+
+         header_values = df_raw.iloc[header_row_index].tolist()
          cleaned_columns = []
          counts = {}
          for idx, h in enumerate(header_values):
              col_name = str(h).strip() if pd.notna(h) else f"Unnamed: {idx}"
              if not col_name: col_name = f"Unnamed: {idx}"
-
-             if col_name in counts:
-                 counts[col_name] += 1
-                 cleaned_columns.append(f"{col_name}.{counts[col_name]}")
-             else:
-                 counts[col_name] = 0
-                 cleaned_columns.append(col_name)
-         # No specific mapping needed if no labels were searched for
-         return header_row_index if len(df_raw) > 0 else None, {}, cleaned_columns
+             if col_name in counts: counts[col_name] += 1; cleaned_columns.append(f"{col_name}.{counts[col_name]}")
+             else: counts[col_name] = 0; cleaned_columns.append(col_name)
+         return header_row_index, {}, cleaned_columns
 
     # Scan rows if specific labels are given
     for i in range(num_rows_to_scan):
         try:
             row_values_series = df_raw.iloc[i]
-            # Convert to strings for searching, handle potential errors during conversion
             row_values_lower = [str(v).lower() if pd.notna(v) else '' for v in row_values_series]
         except Exception as e:
             logging.warning(f"Could not process row {i} as header candidate: {e}")
             continue
 
-        # Check if *all* required labels are present (case-insensitive partial match)
-        found_required_count = 0
         required_labels_lower = [req.lower() for req in required_labels if req]
-        for req_label_lower in required_labels_lower:
-            if any(req_label_lower in cell_lower for cell_lower in row_values_lower):
-                found_required_count += 1
+        found_required_count = sum(1 for req_label_lower in required_labels_lower if any(req_label_lower in cell_lower for cell_lower in row_values_lower))
 
-        # If all required labels are found in the row, consider it the header
         if found_required_count == len(required_labels_lower):
             header_row_index = i
             header_values = df_raw.iloc[header_row_index].tolist()
 
-            # Clean column names (convert to string, strip, handle duplicates)
             cleaned_columns = []
             counts = {}
             for idx, h in enumerate(header_values):
                 col_name = str(h).strip() if pd.notna(h) else f"Unnamed: {idx}"
                 if not col_name: col_name = f"Unnamed: {idx}"
+                if col_name in counts: counts[col_name] += 1; cleaned_columns.append(f"{col_name}.{counts[col_name]}")
+                else: counts[col_name] = 0; cleaned_columns.append(col_name)
 
-                if col_name in counts:
-                    counts[col_name] += 1
-                    cleaned_columns.append(f"{col_name}.{counts[col_name]}")
-                else:
-                    counts[col_name] = 0
-                    cleaned_columns.append(col_name)
-
-            # Map user labels to actual column names found in this header
             column_mapping = {}
-            # Use original header values (converted to lower string) for mapping search
             header_values_lower_for_search = [str(v).lower() if pd.notna(v) else '' for v in header_values]
             for user_label in all_labels_to_find:
                 user_label_lower = user_label.lower()
                 found_match = None
                 for idx, header_cell_lower in enumerate(header_values_lower_for_search):
+                    # Find first occurrence in the header row
                     if user_label_lower in header_cell_lower:
                         found_match = cleaned_columns[idx] # Use the cleaned name
-                        break # Take first match
+                        break
                 column_mapping[user_label] = found_match
 
             logging.info(f"Header found at row index {header_row_index}. Mapping: {column_mapping}")
@@ -129,8 +109,9 @@ def find_header_and_columns(df_raw, required_labels, optional_labels, max_scan_r
     logging.warning("Header row containing all required labels not found within scan limit.")
     return None, {}, None
 
+
 def safe_cell_write(worksheet, row, col, value, cell_format=None):
-    """Writes cell value to worksheet, handling potential type errors."""
+    """Writes cell value to worksheet, handling potential type errors. Needed for audit highlighting."""
     try:
         if pd.isna(value):
             worksheet.write_blank(row, col, None, cell_format)
@@ -138,83 +119,92 @@ def safe_cell_write(worksheet, row, col, value, cell_format=None):
             naive_datetime = value.tz_localize(None) if getattr(value, 'tzinfo', None) is not None else value
             try:
                  worksheet.write_datetime(row, col, naive_datetime, cell_format)
-            except ValueError:
-                 logging.warning(f"Could not write datetime '{value}' at ({row},{col}). Writing as string.")
+            except ValueError: # Handle dates outside Excel's range
                  worksheet.write_string(row, col, str(value), cell_format)
         elif isinstance(value, (int, float)):
-            if pd.isna(value): # Handle numpy NaNs missed by first check
-                 worksheet.write_blank(row, col, None, cell_format)
-            else:
-                 worksheet.write_number(row, col, value, cell_format)
+             if pd.isna(value): worksheet.write_blank(row, col, None, cell_format)
+             else: worksheet.write_number(row, col, value, cell_format)
         elif isinstance(value, bool):
             worksheet.write_boolean(row, col, value, cell_format)
         else:
-            worksheet.write_string(row, col, str(value), cell_format)
+            # Ensure the string is not too long for Excel
+            str_value = str(value)
+            max_len = 32767
+            if len(str_value) > max_len:
+                worksheet.write_string(row, col, str_value[:max_len-3] + "...", cell_format)
+            else:
+                 worksheet.write_string(row, col, str_value, cell_format)
     except Exception as e:
-        logging.error(f"Error writing value '{value}' (type: {type(value)}) at ({row},{col}). Writing as blank. Error: {e}")
-        try:
-            worksheet.write_blank(row, col, None, cell_format) # Fallback to blank on error
-        except Exception as final_e:
-             logging.critical(f"FAILED even to write blank at ({row},{col}): {final_e}")
+        logging.error(f"Error writing value '{str(value)[:50]}' (type: {type(value)}) at ({row},{col}). Writing as blank. Error: {e}")
+        try: worksheet.write_blank(row, col, None, cell_format)
+        except: pass # Ignore error writing blank
 
 
 # ========================
 # Streamlit UI Elements
 # ========================
 
-# --- Sidebar Configuration ---
 st.sidebar.header("⚙️ Configuration")
-value_label = st.sidebar.text_input("Main: Column Name to Grab", "รวมเงิน")
-trans_label = st.sidebar.text_input("Secondary: Column Name to Grab", "รายการ")
-typical_letter = st.sidebar.text_input("Main: Expected Column Letter", "M").upper()
-extra_cols_raw = st.sidebar.text_area("Extra Columns (one per line)", "")
-remove_phrases_raw = st.sidebar.text_area("Remove Rows if cell contains (one per line)", "TOTAL")
-max_scan = st.sidebar.number_input("Header Scan Limit (Rows)", 1, 50, 10) # Increased max limit slightly
-audit_mode = st.sidebar.checkbox("Generate Audit File ZIP?", value=True)
-output_filename = st.sidebar.text_input("Master Report Filename", "Master_Report.xlsx")
-audit_zip_filename = st.sidebar.text_input("Audit ZIP Filename", "Audit_Files.zip")
+value_label = st.sidebar.text_input("Main: Column Name to Grab", "รวมเงิน", key="val_label")
+trans_label = st.sidebar.text_input("Secondary: Column Name to Grab", "รายการ", key="trans_label")
+typical_letter = st.sidebar.text_input("Main: Expected Column Letter", "M", key="typ_letter").upper()
+extra_cols_raw = st.sidebar.text_area("Extra Columns (one per line)", "", key="extra_cols")
+remove_phrases_raw = st.sidebar.text_area("Remove Rows if cell contains (one per line)", "TOTAL", key="remove_phrases")
+max_scan = st.sidebar.number_input("Header Scan Limit (Rows)", 1, 50, 10, key="max_scan")
+audit_mode = st.sidebar.checkbox("Generate Audit File?", value=True, key="audit_mode")
+output_filename = st.sidebar.text_input("Master Report Filename", "Master_Report.xlsx", key="out_fname")
+audit_zip_filename_internal = "Audit_Files.zip" # Internal name for audit zip
+combined_zip_filename = st.sidebar.text_input("Combined Download Filename (if Audit)", "Processing_Results.zip", key="comb_fname")
 
-# Process multiline inputs
 extra_cols_list = [col.strip() for col in extra_cols_raw.strip().splitlines() if col.strip()]
 remove_phrases_list = [phrase.strip() for phrase in remove_phrases_raw.strip().splitlines() if phrase.strip()]
 
-# --- File Uploader ---
 uploaded_files = st.file_uploader(
-    "📂 Upload Excel Files (.xlsx)",
-    type=["xlsx"],
-    accept_multiple_files=True
+    "📂 Upload Excel Files (.xlsx)", type=["xlsx"], accept_multiple_files=True, key="uploader"
 )
 
+# Initialize session state for download data
+if 'download_data' not in st.session_state:
+    st.session_state.download_data = None
+if 'download_filename' not in st.session_state:
+    st.session_state.download_filename = None
+if 'download_mime' not in st.session_state:
+    st.session_state.download_mime = None
+if 'download_ready' not in st.session_state:
+    st.session_state.download_ready = False
+
 # --- Main Execution Logic ---
-if st.button("▶️ Process Uploaded Files") and uploaded_files:
+if st.button("▶️ Process Uploaded Files", key="run_button") and uploaded_files:
+    # Reset download state on new run
+    st.session_state.download_ready = False
+    st.session_state.download_data = None
+
     start_time = datetime.datetime.now()
     st.info(f"Processing started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}...")
 
-    # Placeholders for results
-    master_data = []
-    skipped_sheets_info = []
-    not_typical_col_info = []
-    deleted_rows_data = []
-    error_logs = []
-    audit_data_structure = {} # { orig_filename: { sheet_name: { df_raw: df, ... } } }
+    # Placeholders
+    master_data, skipped_sheets_info, not_typical_col_info, deleted_rows_data, error_logs = [], [], [], [], []
+    audit_data_structure = {}
 
-    # Prepare in-memory buffers
+    # Buffers
     master_output_buffer = io.BytesIO()
-    audit_zip_buffer = io.BytesIO() # For the final ZIP
+    audit_zip_buffer = io.BytesIO() # Only used if audit_mode is True
+    final_zip_buffer = io.BytesIO() # Used for combined download
 
     # --- Input Validation ---
     if not value_label:
          st.error("❗ 'Main: Column Name to Grab' cannot be empty.")
-         st.stop() # Stop execution if main label is missing
+         st.stop()
 
     typical_value_index = col_letter_to_index(typical_letter)
-    if typical_value_index == -1:
+    if typical_value_index == -1 and typical_letter: # Only warn if they provided an invalid letter
         st.warning(f"Invalid typical column letter '{typical_letter}'. Typical check disabled.")
     value_col_not_letter_sheet_name = f"ValueColNot{typical_letter.upper()}" if typical_value_index != -1 else "ValueColTypicalCheck"
     remove_phrases_lower = [p.lower() for p in remove_phrases_list if p]
 
     # --- Progress Bar ---
     progress_bar = st.progress(0)
+    status_text = st.empty()
     total_files = len(uploaded_files)
     files_processed = 0
 
@@ -223,71 +213,66 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
         file_name = uploaded_file.name
         files_processed += 1
         progress_text = f"Processing file {files_processed}/{total_files}: {file_name}"
-        st.text(progress_text)
+        status_text.text(progress_text)
         logging.info(f"Processing file: {file_name}")
 
         try:
-            # Read the entire Excel file from the uploaded buffer
             xls = pd.ExcelFile(uploaded_file)
             sheet_names = xls.sheet_names
-            audit_data_structure[file_name] = {} # Initialize audit structure for this file
+            audit_data_structure[file_name] = {}
         except Exception as e:
             st.error(f"❌ Error reading Excel file '{file_name}'. Skipping. Error: {e}")
             error_logs.append(f"File Read Error ({file_name}): {e}")
             logging.error(f"Error reading file '{file_name}': {e}", exc_info=True)
             progress_bar.progress(files_processed / total_files)
-            continue # Skip to next file
+            continue
 
         # --- Sheet Processing Loop ---
         for sheet_name in sheet_names:
             logging.info(f"-- Processing sheet: {sheet_name}")
             try:
-                # Read raw data, don't assume header yet
-                # Use dtype=object to prevent pandas from guessing types too early, esp. for headers
                 df_raw = xls.parse(sheet_name, header=None, dtype=object)
-                df_raw.index.name = 'OriginalRowIndex'
-                df_raw.reset_index(inplace=True)
+                # IMPORTANT: Keep original index before resetting
+                df_raw['OriginalIndexInDataframe'] = df_raw.index
+                df_raw.index.name = 'OriginalExcelRow' # Index reflects Excel row number (starting 0)
+                df_raw.reset_index(inplace=True) # Make Excel row number a column
 
-                # Find header and map columns
-                required = [value_label] if value_label else [] # Should always have value_label here due to check above
+                required = [value_label]
                 optional = ([trans_label] if trans_label else []) + extra_cols_list
                 header_row_idx, column_map, cleaned_header = find_header_and_columns(
                     df_raw, required, optional, max_scan
                 )
 
-                # Check if essential value column was found
                 actual_value_col = column_map.get(value_label)
                 if header_row_idx is None or not actual_value_col:
                     reason = f"Required column '{value_label}' not found in header scan"
                     st.warning(f"⚠️ Skipping sheet '{sheet_name}' in '{file_name}': {reason}")
                     skipped_sheets_info.append({"File": file_name, "Sheet": sheet_name, "Reason": reason})
                     audit_data_structure[file_name][sheet_name] = {
-                        'df_raw': df_raw.copy(), 'header_row': header_row_idx, 'deleted_indices': set(),
+                        'df_raw': df_raw.copy(), 'header_row': header_row_idx, 'deleted_excel_rows': set(),
                         'col_map': {}, 'cleaned_header': None, 'typical_mismatch': False, 'skipped': True
                     }
-                    continue # Skip this sheet
+                    continue
 
-                # Identify rows to delete
-                deleted_original_indices = set()
+                # Identify rows to delete (using OriginalExcelRow for identification)
+                deleted_excel_rows = set()
                 if remove_phrases_lower:
-                    data_rows_start_index = header_row_idx + 1
-                    for r_idx in range(data_rows_start_index, len(df_raw)):
-                        row_series = df_raw.iloc[r_idx]
-                        # Important: Convert row to strings for robust checking across types
+                    data_rows_start_index_in_df = header_row_idx + 1 # Start checking after header row in df_raw
+                    for df_idx in range(data_rows_start_index_in_df, len(df_raw)):
+                        row_series = df_raw.iloc[df_idx]
                         row_strs_lower = [str(cell).lower() if pd.notna(cell) else '' for cell in row_series]
                         if any(phrase in cell_str for cell_str in row_strs_lower for phrase in remove_phrases_lower):
-                           original_index = df_raw.loc[r_idx, 'OriginalRowIndex']
-                           deleted_original_indices.add(original_index)
-                           # Store full deleted row data
-                           deleted_rec = df_raw.iloc[r_idx].to_dict()
-                           deleted_rec['FileName'] = file_name
-                           deleted_rec['SheetName'] = sheet_name
-                           renamed_deleted_rec = {'FileName': file_name, 'SheetName': sheet_name, 'OriginalRowIndex': original_index}
-                           for h_idx, h_name in enumerate(cleaned_header):
-                               # Access raw data by position using h_idx, map to cleaned_header name
-                               renamed_deleted_rec[h_name] = deleted_rec.get(h_idx, None)
+                           original_excel_row = df_raw.loc[df_idx, 'OriginalExcelRow']
+                           deleted_excel_rows.add(original_excel_row)
+                           # Store full deleted row data using cleaned header names
+                           deleted_rec = df_raw.iloc[df_idx].to_dict()
+                           renamed_deleted_rec = {'FileName': file_name, 'SheetName': sheet_name, 'OriginalExcelRow': original_excel_row}
+                           if cleaned_header: # Map raw data (0, 1, ...) to cleaned names
+                               for h_idx, h_name in enumerate(cleaned_header):
+                                   renamed_deleted_rec[h_name] = deleted_rec.get(h_idx, None)
+                           else: # Fallback if no cleaned header (e.g., took first row)
+                               renamed_deleted_rec.update({k:v for k,v in deleted_rec.items() if k not in ['FileName', 'SheetName', 'OriginalExcelRow']})
                            deleted_rows_data.append(renamed_deleted_rec)
-
 
                 # Check typical column location
                 typical_mismatch = False
@@ -301,52 +286,45 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
                                 "ValueColumnFound": actual_value_col, "FoundIndex": actual_value_col_index,
                                 "ExpectedLetter": typical_letter, "ExpectedIndex": typical_value_index
                             })
-                            logging.warning(f"Typical mismatch in {file_name}/{sheet_name}: '{actual_value_col}' found at index {actual_value_col_index}, expected {typical_value_index} ('{typical_letter}')")
-                    except (ValueError, IndexError):
-                         logging.warning(f"Could not find '{actual_value_col}' in cleaned header list for typical check.")
-
+                    except (ValueError, IndexError): pass # Ignore if column not found in cleaned list
 
                 # Extract data for master report
-                data_rows_start_index = header_row_idx + 1
+                data_rows_start_index_in_df = header_row_idx + 1
                 actual_trans_col = column_map.get(trans_label)
                 extra_col_map = {lbl: column_map.get(lbl) for lbl in extra_cols_list}
 
-                for r_idx in range(data_rows_start_index, len(df_raw)):
-                    original_index = df_raw.loc[r_idx, 'OriginalRowIndex']
-                    if original_index not in deleted_original_indices:
-                        row_data = df_raw.iloc[r_idx] # This is a Series using original 0, 1, ... index
+                for df_idx in range(data_rows_start_index_in_df, len(df_raw)):
+                    original_excel_row = df_raw.loc[df_idx, 'OriginalExcelRow']
+                    if original_excel_row not in deleted_excel_rows:
+                        row_data = df_raw.iloc[df_idx] # Raw data series (indexed by 0, 1, ...)
                         entry = {
-                            "SourceFile": file_name,
-                            "SourceSheet": sheet_name,
-                            "OriginalRowIndex": original_index
+                            "SourceFile": file_name, "SourceSheet": sheet_name,
+                            "OriginalExcelRow": original_excel_row # Use Excel row for reference
                         }
                         try:
-                             # Map cleaned header names back to their index in the cleaned_header list
-                             # Use that index to get data from the raw row Series
-                            val_col_idx_in_header = cleaned_header.index(actual_value_col) if actual_value_col else -1
+                            # Map required cols using cleaned_header index lookup
+                            val_col_idx_in_header = cleaned_header.index(actual_value_col) if actual_value_col and cleaned_header else -1
                             entry[value_label] = row_data.iloc[val_col_idx_in_header] if val_col_idx_in_header != -1 else None
 
-                            trans_col_idx_in_header = cleaned_header.index(actual_trans_col) if actual_trans_col else -1
+                            trans_col_idx_in_header = cleaned_header.index(actual_trans_col) if actual_trans_col and cleaned_header else -1
                             entry[trans_label] = row_data.iloc[trans_col_idx_in_header] if trans_col_idx_in_header != -1 else None
 
                             for label, actual_col in extra_col_map.items():
-                                ex_col_idx_in_header = cleaned_header.index(actual_col) if actual_col else -1
+                                ex_col_idx_in_header = cleaned_header.index(actual_col) if actual_col and cleaned_header else -1
                                 entry[label] = row_data.iloc[ex_col_idx_in_header] if ex_col_idx_in_header != -1 else None
 
                             master_data.append(entry)
                         except (ValueError, IndexError) as lookup_error:
-                             err_msg = f"Column Mapping/Lookup Error ({file_name}/{sheet_name}/Row {original_index}): {lookup_error}"
+                             err_msg = f"Column Mapping/Lookup Error ({file_name}/{sheet_name}/Row {original_excel_row}): {lookup_error}"
                              logging.error(err_msg)
                              error_logs.append(err_msg)
-                             # Add placeholders for this row in master data? Or skip row? Skipping for now.
                              st.warning(f"⚠️ {err_msg}. Skipping row.")
-
 
                 # Store data needed for audit highlighting
                 audit_data_structure[file_name][sheet_name] = {
-                    'df_raw': df_raw.copy(),
-                    'header_row': header_row_idx,
-                    'deleted_indices': deleted_original_indices,
+                    'df_raw': df_raw.copy(), # Contains 'OriginalExcelRow'
+                    'header_row_in_df': header_row_idx, # Index within df_raw where header was found
+                    'deleted_excel_rows': deleted_excel_rows, # Set of OriginalExcelRow values
                     'col_map': column_map,
                     'cleaned_header': cleaned_header,
                     'typical_mismatch': typical_mismatch,
@@ -359,14 +337,14 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
                 error_logs.append(f"Sheet Processing Error ({file_name}/{sheet_name}): {e}")
                 logging.error(f"Error processing sheet '{sheet_name}' in file '{file_name}': {e}", exc_info=True)
                 audit_data_structure[file_name][sheet_name] = {
-                     'df_raw': pd.DataFrame(), 'header_row': None, 'deleted_indices': set(),
+                     'df_raw': pd.DataFrame(), 'header_row_in_df': None, 'deleted_excel_rows': set(),
                      'col_map': {}, 'cleaned_header': None, 'typical_mismatch': False, 'skipped': True, 'error': str(e)
                 }
         # --- End Sheet Loop ---
         progress_bar.progress(files_processed / total_files)
     # --- End File Loop ---
 
-    st.success(f"✅ File processing completed in {datetime.datetime.now() - start_time}.")
+    status_text.success(f"✅ File processing completed in {datetime.datetime.now() - start_time}.")
 
     # ============================
     # Combine & Analyze Master Data
@@ -380,11 +358,7 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
     analysis_df = pd.DataFrame()
     if not master_df.empty and value_label and value_label in master_df.columns:
         numeric_col_name = f"{value_label}_numeric"
-        # Convert to string first to handle mixed types before replacing comma
-        master_df[numeric_col_name] = pd.to_numeric(
-            master_df[value_label].astype(str).str.replace(',', '', regex=False),
-            errors='coerce'
-        )
+        master_df[numeric_col_name] = pd.to_numeric(master_df[value_label].astype(str).str.replace(',', '', regex=False), errors='coerce')
         if numeric_col_name in master_df.columns and master_df[numeric_col_name].notna().any():
              analysis_df = pd.DataFrame(master_df[numeric_col_name].describe())
 
@@ -395,21 +369,20 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
     try:
         with pd.ExcelWriter(master_output_buffer, engine="xlsxwriter", engine_kwargs={"options":{"nan_inf_to_errors": True}}) as writer:
             if not master_df.empty:
-                 cols_order = ["SourceFile", "SourceSheet", "OriginalRowIndex"]
+                 cols_order = ["SourceFile", "SourceSheet", "OriginalExcelRow"] # Use Excel Row
                  if value_label: cols_order.append(value_label)
                  if trans_label: cols_order.append(trans_label)
                  cols_order.extend(extra_cols_list)
                  if f"{value_label}_numeric" in master_df.columns: cols_order.append(f"{value_label}_numeric")
                  cols_order.extend([col for col in master_df.columns if col not in cols_order])
                  master_df.to_excel(writer, sheet_name='AllData', index=False, columns=cols_order)
-            else: # Write empty sheet if no data extracted
-                 pd.DataFrame().to_excel(writer, sheet_name='AllData', index=False)
+            else: pd.DataFrame().to_excel(writer, sheet_name='AllData', index=False)
 
-            # Write other info sheets only if they have data
             if not skipped_df.empty: skipped_df.to_excel(writer, sheet_name='SkippedSheets', index=False)
             if not not_typical_df.empty: not_typical_df.to_excel(writer, sheet_name=value_col_not_letter_sheet_name, index=False)
             if not deleted_df.empty:
-                deleted_cols = ['FileName', 'SheetName', 'OriginalRowIndex'] + [col for col in deleted_df.columns if col not in ['FileName', 'SheetName', 'OriginalRowIndex']]
+                # Use OriginalExcelRow in deleted sheet too
+                deleted_cols = ['FileName', 'SheetName', 'OriginalExcelRow'] + [col for col in deleted_df.columns if col not in ['FileName', 'SheetName', 'OriginalExcelRow']]
                 deleted_df.to_excel(writer, sheet_name='DeletedRows', index=False, columns=deleted_cols)
             if not analysis_df.empty: analysis_df.to_excel(writer, sheet_name='ValueColumnAnalysis')
             if not errors_df.empty: errors_df.to_excel(writer, sheet_name='ProcessingErrors', index=False)
@@ -419,194 +392,211 @@ if st.button("▶️ Process Uploaded Files") and uploaded_files:
         st.error(f"❌ Error creating Master Report Excel buffer: {e}")
         logging.error(f"Error creating Master Report buffer: {e}", exc_info=True)
 
-
     # ============================
     # Generate Audit Files + ZIP (if enabled)
     # ============================
     audit_zip_generated = False
     if audit_mode:
         files_audited = 0
-        st.info("⚙️ Generating Audit Files ZIP...")
+        status_text.info("⚙️ Generating Audit Files ZIP...")
         audit_progress = st.progress(0)
-        audit_file_count = sum(len(sheets) for sheets in audit_data_structure.values())
+        total_audit_sheets = sum(len(sheets) for sheets in audit_data_structure.values())
         audit_sheets_processed = 0
 
         try:
             with zipfile.ZipFile(audit_zip_buffer, "w", zipfile.ZIP_DEFLATED) as audit_zip:
                 for orig_filename, sheets_data in audit_data_structure.items():
-                    # Use an in-memory buffer for each individual audit Excel file
                     audit_excel_buffer = io.BytesIO()
                     audit_file_has_content = False
                     try:
-                        with pd.ExcelWriter(audit_excel_buffer, engine="xlsxwriter", engine_kwargs={"options":{"nan_inf_to_errors":True}}) as writer:
+                        # Use ExcelWriter for formatting control
+                        with pd.ExcelWriter(audit_excel_buffer, engine="xlsxwriter", engine_kwargs={"options": {"nan_inf_to_errors": True}}) as writer:
                             workbook = writer.book
-                            # Define formats
-                            deleted_fmt = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}) # Red fill
-                            extracted_fmt = workbook.add_format({'bg_color': '#FFEB9C'}) # Yellow fill
-                            mismatch_fmt = workbook.add_format({'bg_color': '#E4DFEC'}) # Purple fill (value col mismatch)
-                            header_fmt = workbook.add_format({'bg_color': '#D9D9D9', 'bold': True}) # Grey fill, bold
-                            skipped_fmt = workbook.add_format({'font_color': '#A6A6A6'}) # Grey text for skipped
+                            red_fill = workbook.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
+                            yellow_fill = workbook.add_format({"bg_color": "#FFEB9C"})
+                            purple_fill = workbook.add_format({"bg_color": "#E4DFEC"})
+                            header_fmt = workbook.add_format({'bg_color': '#D9D9D9', 'bold': True})
+                            skipped_fmt = workbook.add_format({'font_color': '#A6A6A6'})
 
                             for sheet_name, audit_info in sheets_data.items():
                                 audit_sheets_processed += 1
-                                audit_file_has_content = True # Assume content unless df is empty AND not skipped/errored
-                                df_audit = audit_info.get('df_raw', pd.DataFrame())
+                                audit_file_has_content = True # Assume content initially
+                                df_audit_raw = audit_info.get('df_raw', pd.DataFrame())
+                                if df_audit_raw.empty: continue # Skip empty raw DFs
 
                                 ws = workbook.add_worksheet(sheet_name[:31])
-                                writer.sheets[sheet_name[:31]] = ws # Associate sheet object
+                                writer.sheets[sheet_name[:31]] = ws
 
-                                if df_audit.empty and not audit_info.get('skipped'):
-                                    audit_file_has_content = False # No real content
-                                    safe_cell_write(ws, 0, 0, "(Sheet was empty in source)", skipped_fmt)
-                                    continue # Skip writing empty sheet unless it was skipped/errored
-
-                                # Extract highlight info
-                                header_row = audit_info.get('header_row')
-                                deleted_indices = audit_info.get('deleted_indices', set())
+                                # --- Apply Highlighting Logic (adapted from Colab) ---
+                                header_row_in_df = audit_info.get('header_row_in_df') # Index in df_audit_raw
+                                deleted_excel_rows = audit_info.get('deleted_excel_rows', set())
                                 col_map = audit_info.get('col_map', {})
                                 cleaned_header = audit_info.get('cleaned_header')
                                 typical_mismatch = audit_info.get('typical_mismatch', False)
                                 is_skipped = audit_info.get('skipped', False)
                                 error_msg = audit_info.get('error')
 
-                                if is_skipped or error_msg:
-                                     reason = f"Sheet Skipped ({audit_info.get('reason', 'Unknown')})" if is_skipped else f"Sheet Errored: {error_msg}"
-                                     safe_cell_write(ws, 0, 0, reason, skipped_fmt)
-                                     # Optionally write raw data below if available
-                                     if not df_audit.empty:
-                                         for c_idx_raw, col_name_raw in enumerate(df_audit.columns):
-                                              safe_cell_write(ws, 2, c_idx_raw, col_name_raw, header_fmt)
-                                              for r_idx_raw in range(len(df_audit)):
-                                                  safe_cell_write(ws, r_idx_raw + 3, c_idx_raw, df_audit.iloc[r_idx_raw, c_idx_raw], skipped_fmt)
-                                     continue # Don't apply other highlights
+                                if is_skipped or error_msg: # Handle skipped/errored sheets first
+                                    reason = f"Sheet Skipped ({audit_info.get('reason', 'Unknown')})" if is_skipped else f"Sheet Errored: {error_msg}"
+                                    safe_cell_write(ws, 0, 0, reason, skipped_fmt)
+                                    # Optionally write raw data below if available, marked as skipped
+                                    raw_cols = df_audit_raw.columns.tolist()
+                                    for c_idx, col_name in enumerate(raw_cols):
+                                        safe_cell_write(ws, 2, c_idx, col_name, skipped_fmt)
+                                        for r_idx in range(len(df_audit_raw)):
+                                            safe_cell_write(ws, r_idx + 3, c_idx, df_audit_raw.iloc[r_idx, c_idx], skipped_fmt)
+                                    continue # Skip normal highlighting
 
-                                # Get actual column names to highlight
+                                # Write data first (cell by cell for format control)
+                                raw_cols = df_audit_raw.columns.tolist()
+                                for c_idx, col_name in enumerate(raw_cols):
+                                    safe_cell_write(ws, 0, c_idx, col_name) # Write header (raw names: 0, 1, ..)
+                                for r_idx in range(len(df_audit_raw)):
+                                    for c_idx, col_name in enumerate(raw_cols):
+                                        safe_cell_write(ws, r_idx + 1, c_idx, df_audit_raw.iloc[r_idx, c_idx]) # +1 for header
+
+                                # Apply formats row by row, then column by column
                                 actual_value_col = col_map.get(value_label)
                                 actual_trans_col = col_map.get(trans_label)
                                 actual_extra_cols = [col_map.get(lbl) for lbl in extra_cols_list if col_map.get(lbl)]
+                                used_cols = [c for c in [actual_value_col, actual_trans_col] + actual_extra_cols if c]
 
-                                # Find indices in the *cleaned header* for mapping highlights
-                                col_indices_in_cleaned_header = {}
+                                value_col_idx_in_cleaned = -1
+                                used_col_indices_in_cleaned = {}
                                 if cleaned_header:
-                                     try:
-                                         if actual_value_col: col_indices_in_cleaned_header[actual_value_col] = cleaned_header.index(actual_value_col)
-                                         if actual_trans_col: col_indices_in_cleaned_header[actual_trans_col] = cleaned_header.index(actual_trans_col)
-                                         for col in actual_extra_cols: col_indices_in_cleaned_header[col] = cleaned_header.index(col)
-                                     except (ValueError, IndexError):
-                                         logging.warning(f"Audit Highlight Warning: Could not map all column names back to cleaned header indices in {orig_filename}/{sheet_name}")
+                                    try:
+                                        if actual_value_col: value_col_idx_in_cleaned = cleaned_header.index(actual_value_col)
+                                        for col in used_cols: used_col_indices_in_cleaned[col] = cleaned_header.index(col)
+                                    except ValueError: pass # Ignore if col not found
 
-                                # Write header (original column names/indices from df_raw)
-                                raw_cols = df_audit.columns.tolist()
-                                for c_idx, col_name in enumerate(raw_cols):
-                                     safe_cell_write(ws, 0, c_idx, col_name, header_fmt if header_row==0 else None)
+                                # Apply formats
+                                for r_idx in range(len(df_audit_raw)):
+                                    original_excel_row = df_audit_raw.loc[r_idx, 'OriginalExcelRow']
+                                    is_deleted = original_excel_row in deleted_excel_rows
+                                    is_header = header_row_in_df is not None and r_idx == header_row_in_df
 
-                                # Write data rows
-                                for r_idx in range(len(df_audit)):
-                                    row_data = df_audit.iloc[r_idx]
-                                    original_row_idx = row_data.get('OriginalRowIndex', -1) # Get original index if column exists
-                                    current_format = None
+                                    # 1. Apply row-level formats (Red for deleted, Grey for header)
+                                    row_format = None
+                                    if is_deleted:
+                                        row_format = red_fill
+                                    elif is_header:
+                                        row_format = header_fmt
 
-                                    # Determine base row format
-                                    if original_row_idx in deleted_indices:
-                                        current_format = deleted_fmt
-                                    elif header_row is not None and r_idx == header_row:
-                                        current_format = header_fmt
+                                    if row_format:
+                                        # Apply format to existing cells in the row
+                                        for c_idx in range(len(raw_cols)):
+                                             cell_val = df_audit_raw.iloc[r_idx, c_idx]
+                                             safe_cell_write(ws, r_idx + 1, c_idx, cell_val, row_format)
 
-                                    # Write cells for this row
-                                    for c_idx, col_name in enumerate(raw_cols):
-                                        cell_value = row_data.iloc[c_idx]
-                                        cell_format_to_use = current_format # Start with row format
+                                    # 2. Apply column-level formats (Yellow/Purple) only if NOT deleted and NOT header
+                                    if not is_deleted and not is_header and cleaned_header:
+                                        for c_idx in range(min(len(raw_cols), len(cleaned_header))): # Iterate based on cleaned header length
+                                            current_cleaned_col = cleaned_header[c_idx]
+                                            cell_val = df_audit_raw.iloc[r_idx, c_idx]
+                                            col_format = None
 
-                                        # Apply column-specific highlights (only if it's a data row)
-                                        is_data_row = (header_row is not None and r_idx > header_row and original_row_idx not in deleted_indices)
-                                        if is_data_row and cleaned_header and c_idx < len(cleaned_header): # Check index bounds
-                                            current_cleaned_col_name = cleaned_header[c_idx] # Get cleaned name for this column index
-                                            col_is_value = (actual_value_col == current_cleaned_col_name)
-                                            col_is_trans = (actual_trans_col == current_cleaned_col_name)
-                                            col_is_extra = (current_cleaned_col_name in actual_extra_cols)
+                                            is_value_col = (value_col_idx_in_cleaned == c_idx)
+                                            is_used_col = (current_cleaned_col in used_cols)
 
-                                            if col_is_value and typical_mismatch:
-                                                cell_format_to_use = mismatch_fmt # Purple overrides yellow
-                                            elif col_is_value or col_is_trans or col_is_extra:
-                                                cell_format_to_use = extracted_fmt # Yellow
+                                            if is_value_col and typical_mismatch:
+                                                col_format = purple_fill # Purple overrides yellow
+                                            elif is_used_col:
+                                                col_format = yellow_fill
 
-                                        safe_cell_write(ws, r_idx + 1, c_idx, cell_value, cell_format_to_use) # +1 for header offset
+                                            if col_format:
+                                                safe_cell_write(ws, r_idx + 1, c_idx, cell_val, col_format)
 
-                                # Update audit progress bar
-                                if audit_file_count > 0:
-                                     audit_progress.progress(audit_sheets_processed / audit_file_count)
+                                if total_audit_sheets > 0:
+                                     audit_progress.progress(audit_sheets_processed / total_audit_sheets)
 
-                        # Add the generated Excel file (in memory) to the zip archive
-                        audit_filename_in_zip = f"{orig_filename.rsplit('.', 1)[0]}_audit.xlsx"
+                        # --- End sheet loop for this file's audit excel ---
+                        audit_excel_filename = f"{orig_filename.rsplit('.', 1)[0]}_audit.xlsx"
                         if audit_file_has_content:
-                            audit_zip.writestr(audit_filename_in_zip, audit_excel_buffer.getvalue())
+                            audit_zip.writestr(audit_excel_filename, audit_excel_buffer.getvalue())
                             files_audited += 1
-                            logging.info(f"Added audit file to ZIP: {audit_filename_in_zip}")
                         else:
-                             logging.info(f"Skipped adding empty/errored audit file to ZIP: {audit_filename_in_zip}")
+                             logging.info(f"Skipped adding empty/errored audit file to ZIP: {audit_excel_filename}")
 
                     except Exception as sheet_audit_error:
                          st.error(f"❌ Error creating audit Excel buffer for '{orig_filename}': {sheet_audit_error}")
                          error_logs.append(f"Audit File Creation Error ({orig_filename}): {sheet_audit_error}")
                          logging.error(f"Error creating audit Excel buffer for '{orig_filename}': {sheet_audit_error}", exc_info=True)
                     finally:
-                        audit_excel_buffer.close() # Close the individual buffer
-
+                        audit_excel_buffer.close()
+            # --- End Audit Zip generation ---
             audit_zip_generated = (files_audited > 0)
-            audit_progress.progress(1.0) # Mark as complete
-            if audit_zip_generated:
-                 st.success(f"✅ Audit ZIP generated with {files_audited} file(s).")
-                 logging.info(f"Audit ZIP buffer generated with {files_audited} file(s).")
-            else:
-                 st.warning("⚠️ No valid audit files were generated.")
+            audit_progress.progress(1.0)
+            if audit_zip_generated: st.success(f"✅ Audit ZIP generated with {files_audited} file(s).")
+            else: st.warning("⚠️ No valid audit files were generated.")
 
         except Exception as zip_error:
             st.error(f"❌ Error creating Audit ZIP file: {zip_error}")
             logging.error(f"Error creating Audit ZIP: {zip_error}", exc_info=True)
 
     # ============================
-    # Display Download Buttons
+    # Prepare Download Data (using Session State)
     # ============================
+    status_text.text("Preparing download...")
+    if audit_mode and master_report_generated and audit_zip_generated:
+        # Combine Master and Audit into a final ZIP
+        try:
+            with zipfile.ZipFile(final_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as final_zip:
+                # Add Master Report
+                master_output_buffer.seek(0)
+                final_zip.writestr(output_filename, master_output_buffer.read())
+                # Add Audit ZIP
+                audit_zip_buffer.seek(0)
+                final_zip.writestr(audit_zip_filename_internal, audit_zip_buffer.read())
+
+            st.session_state.download_data = final_zip_buffer.getvalue()
+            st.session_state.download_filename = combined_zip_filename
+            st.session_state.download_mime = "application/zip"
+            st.session_state.download_ready = True
+            logging.info(f"Prepared combined ZIP for download: {combined_zip_filename}")
+
+        except Exception as e:
+            st.error(f"❌ Failed to create combined ZIP: {e}")
+            logging.error(f"Failed to create combined ZIP: {e}", exc_info=True)
+            st.session_state.download_ready = False
+
+    elif master_report_generated:
+        # Only download Master Report
+        st.session_state.download_data = master_output_buffer.getvalue()
+        st.session_state.download_filename = output_filename
+        st.session_state.download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        st.session_state.download_ready = True
+        logging.info(f"Prepared Master Report for download: {output_filename}")
+    else:
+        st.error("❌ Processing complete, but no files could be generated for download.")
+        st.session_state.download_ready = False
+
+    # Clean up buffers
+    master_output_buffer.close()
+    audit_zip_buffer.close()
+    final_zip_buffer.close()
+    status_text.text("Processing complete. Download ready below.")
+
+
+# --- Display Download Button ---
+if st.session_state.download_ready and st.session_state.download_data:
     st.markdown("---")
     st.subheader("⬇️ Download Results")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if master_report_generated:
-            st.download_button(
-                label="📥 Download Master Report",
-                data=master_output_buffer.getvalue(),
-                file_name=output_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_master" # Unique key
-            )
-            st.caption(f"Filename: `{output_filename}`")
-        else:
-            st.error("Master Report generation failed.")
-
-    with col2:
-        if audit_mode:
-            if audit_zip_generated:
-                st.download_button(
-                    label="📥 Download Audit ZIP",
-                    data=audit_zip_buffer.getvalue(),
-                    file_name=audit_zip_filename,
-                    mime="application/zip",
-                    key="download_audit" # Unique key
-                )
-                st.caption(f"Filename: `{audit_zip_filename}`")
-            else:
-                st.warning("Audit ZIP generation failed or was skipped.")
-        else:
-            st.info("Audit file generation was disabled.")
-
-
+    st.download_button(
+        label="📥 Download Processed File(s)",
+        data=st.session_state.download_data,
+        file_name=st.session_state.download_filename,
+        mime=st.session_state.download_mime,
+        key="final_download_button"
+    )
+    st.caption(f"Filename: `{st.session_state.download_filename}`")
 else:
-    # Initial state or after reset
-    st.info("☝️ Configure settings in the sidebar, upload Excel file(s), and click 'Process Uploaded Files'.")
+    # Show initial message or message if processing failed to produce downloads
+    if not uploaded_files:
+         st.info("☝️ Configure settings, upload Excel file(s), and click 'Process Uploaded Files'.")
+    # (Error messages handled during processing if downloads fail)
 
-# Add a footer or link (optional)
+
+# --- Footer ---
 st.markdown("---")
-st.caption("MaxCode Smart Excel Grabber")
+st.caption("MaxCode | Smart Excel Grabber")
 
